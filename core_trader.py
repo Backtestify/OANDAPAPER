@@ -37,6 +37,9 @@ class RiskConfig:
     marginUtilizationLimit: float = 0.80
     enforceEquityCap: bool = True
 
+    # Option A: center grid around current synthetic price (BI still derived from HS)
+    centerGridOnCurrent: bool = True
+
     @property
     def buyWagerUsd(self) -> float:
         return self.totalCapitalUsd * (self.maxActiveCapitalFraction / self.numBuyWagers)
@@ -100,15 +103,7 @@ class OandaBroker(Broker):
     def _newClientExtensions(self, clientTag: str) -> dict:
         return {"id": f"{clientTag}-{uuid.uuid4().hex[:12]}", "tag": clientTag, "comment": "triangular-grid"}
 
-    def _postOrder(
-        self,
-        instrument: str,
-        units: int,
-        orderType: str = "MARKET",
-        price: Optional[float] = None,
-        tif: str = "FOK",
-        clientTag: str = "tg",
-    ) -> dict:
+    def _postOrder(self, instrument: str, units: int, orderType: str = "MARKET", price: Optional[float] = None, tif: str = "FOK", clientTag: str = "tg") -> dict:
         url = f"{self._apiHost()}/v3/accounts/{self.accountId}/orders"
         order: dict = {
             "instrument": instrument,
@@ -126,12 +121,7 @@ class OandaBroker(Broker):
 
     def _closePosition(self, instrument: str) -> None:
         url = f"{self._apiHost()}/v3/accounts/{self.accountId}/positions/{instrument}/close"
-        r = requests.put(
-            url,
-            headers=self._headers(),
-            json={"longUnits": "ALL", "shortUnits": "ALL"},
-            timeout=self.requestTimeoutSec,
-        )
+        r = requests.put(url, headers=self._headers(), json={"longUnits": "ALL", "shortUnits": "ALL"}, timeout=self.requestTimeoutSec)
         if r.status_code >= 300:
             raise RuntimeError(f"OANDA close error {r.status_code}: {r.text}")
 
@@ -207,7 +197,7 @@ class GridLevel:
     levelState: LevelState = LevelState.IDLE
     levelEntrySyntheticPrice: Optional[float] = None
     levelTakeProfitSyntheticPrice: Optional[float] = None
-    usdNotionalPerLeg: float = 0.0
+    usdNotionalPerLeg: float = 0.0  # absolute per-leg USD notional used when opening this level
 
 
 @dataclass
@@ -335,7 +325,7 @@ class StateStore:
                         lvl.levelState.name,
                         None if lvl.levelEntrySyntheticPrice is None else float(lvl.levelEntrySyntheticPrice),
                         None if lvl.levelTakeProfitSyntheticPrice is None else float(lvl.levelTakeProfitSyntheticPrice),
-                        lvl.usdNotionalPerLeg,
+                        float(lvl.usdNotionalPerLeg),
                     ),
                 )
 
@@ -363,9 +353,9 @@ class StateStore:
                 "INSERT OR REPLACE INTO strategy_state(id,prev_px,active_cap_unlev,opened,closed) VALUES(1,?,?,?,?)",
                 (
                     None if st.previousSyntheticPrice is None else float(st.previousSyntheticPrice),
-                    st.activeCapitalUsdUnlevered,
-                    st.tradesOpenedCount,
-                    st.tradesClosedCount,
+                    float(st.activeCapitalUsdUnlevered),
+                    int(st.tradesOpenedCount),
+                    int(st.tradesClosedCount),
                 ),
             )
 
@@ -382,9 +372,7 @@ class StateStore:
                 tradesClosedCount=int(closed),
             )
 
-    def recordExecution(
-        self, ts: datetime, action: str, levelPrice: float, unitsUsdJpy: int, unitsUsdCnh: int, clientTag: str
-    ):
+    def recordExecution(self, ts: datetime, action: str, levelPrice: float, unitsUsdJpy: int, unitsUsdCnh: int, clientTag: str):
         with self._connect() as cx:
             cx.execute(
                 "INSERT OR REPLACE INTO executions(id,ts,action,level_price,units_usdjpy,units_usdcnh,client_tag) VALUES(?,?,?,?,?,?,?)",
@@ -398,14 +386,7 @@ class StateStore:
                 (limit,),
             ).fetchall()
             return [
-                {
-                    "ts": int(ts),
-                    "action": action,
-                    "levelPrice": float(level_price),
-                    "unitsUsdJpy": int(u1),
-                    "unitsUsdCnh": int(u2),
-                    "clientTag": tag,
-                }
+                {"ts": int(ts), "action": action, "levelPrice": float(level_price), "unitsUsdJpy": int(u1), "unitsUsdCnh": int(u2), "clientTag": tag}
                 for ts, action, level_price, u1, u2, tag in rows
             ]
 
@@ -429,13 +410,7 @@ class StateStore:
             if not row:
                 return None
             ts, balance, nav, unrealized, currency = row
-            return {
-                "ts": int(ts),
-                "balance": float(balance),
-                "nav": float(nav),
-                "unrealized": float(unrealized),
-                "currency": currency,
-            }
+            return {"ts": int(ts), "balance": float(balance), "nav": float(nav), "unrealized": float(unrealized), "currency": currency}
 
 
 def synthCnhJpy(usdcnhPrice: float, usdjpyPrice: float) -> float:
@@ -444,9 +419,7 @@ def synthCnhJpy(usdcnhPrice: float, usdjpyPrice: float) -> float:
     return usdjpyPrice / usdcnhPrice
 
 
-def worstDrawdownWithinWindow(
-    priceSeries: List[Tuple[datetime, float]], maxDays: int = 730
-) -> Tuple[float, float, datetime, datetime]:
+def worstDrawdownWithinWindow(priceSeries: List[Tuple[datetime, float]], maxDays: int = 730) -> Tuple[float, float, datetime, datetime]:
     if not priceSeries or len(priceSeries) < 2:
         raise ValueError("need ≥2 points")
     times = [t for t, _ in priceSeries]
@@ -551,13 +524,7 @@ def optimizeGridDensity(
                 best = rec
     if best is None:
         raise ValueError("no feasible grid under margin constraints")
-    return {
-        "best": best,
-        "candidates": sorted(candidates, key=lambda x: -x["evPerDayUsd"])[:10],
-        "hsHigh": hsh,
-        "hsLow": hsl,
-        "hsAbs": hsAbs,
-    }
+    return {"best": best, "candidates": sorted(candidates, key=lambda x: -x["evPerDayUsd"])[:10], "hsHigh": hsh, "hsLow": hsl, "hsAbs": hsAbs}
 
 
 @dataclass
@@ -579,11 +546,18 @@ class TriangularGridStrategy:
         self.historicLossHighTime, self.historicLossLowTime = timeHigh, timeLow
         hsAbs = max(hsh - hsl, 0.0)
         self.buyIncrement = max(hsAbs / float(self.riskConfig.numBuyWagers), self.riskConfig.minTick)
+
+        currentPx = syntheticCnhJpyHistory[-1][1]
+        if self.riskConfig.centerGridOnCurrent:
+            n = self.riskConfig.numBuyWagers
+            start = currentPx - (n / 2.0) * self.buyIncrement
+        else:
+            start = hsl
+
         self.gridLevels = []
         for levelIndex in range(0, self.riskConfig.numBuyWagers + 1):
-            levelPrice = hsl + levelIndex * self.buyIncrement
-            usdNotionalPerLeg = (self.riskConfig.buyWagerUsd * self.riskConfig.leverageMultiplier) / 2
-            self.gridLevels.append(GridLevel(levelPrice=levelPrice, usdNotionalPerLeg=usdNotionalPerLeg))
+            levelPrice = start + levelIndex * self.buyIncrement
+            self.gridLevels.append(GridLevel(levelPrice=levelPrice, usdNotionalPerLeg=0.0))
         self.stateStore.saveGridLevels(self.gridLevels)
 
     def _capAvailableUsdUnlevered(self) -> float:
@@ -609,13 +583,17 @@ class TriangularGridStrategy:
             return False
         return (previousPrice - levelPrice) * (currentPrice - levelPrice) <= 0.0
 
+    def _currentUsdNotionalPerLeg(self) -> float:
+        return (self.riskConfig.buyWagerUsd * self.riskConfig.leverageMultiplier) / 2.0
+
     def _tryOpenLevel(self, level: GridLevel, syntheticPrice: float, usdcnhPrice: float, usdjpyPrice: float, timestamp: datetime):
         if level.levelState != LevelState.IDLE:
             return
         if not self._canOpenLevel():
             return
-        legUnitsUsdJpy = int(round(+level.usdNotionalPerLeg))
-        legUnitsUsdCnh = int(round(-level.usdNotionalPerLeg))
+        usdNotionalPerLegNow = self._currentUsdNotionalPerLeg()
+        legUnitsUsdJpy = int(round(+usdNotionalPerLegNow))
+        legUnitsUsdCnh = int(round(-usdNotionalPerLegNow))
         clientTag = f"lvl-{int(level.levelPrice*1e6)}"
         didExecute = self.executionBroker.executeTwoLegMarket(legUnitsUsdJpy, legUnitsUsdCnh, clientTag, timestamp)
         if not didExecute:
@@ -623,6 +601,7 @@ class TriangularGridStrategy:
         level.levelState = LevelState.HELD
         level.levelEntrySyntheticPrice = syntheticPrice
         level.levelTakeProfitSyntheticPrice = syntheticPrice * (1.0 + self.riskConfig.takeProfitPct)
+        level.usdNotionalPerLeg = usdNotionalPerLegNow
         self.strategyState.activeCapitalUsdUnlevered += self.riskConfig.buyWagerUsd
         self.strategyState.tradesOpenedCount += 1
         self.stateStore.recordExecution(timestamp, "OPEN", level.levelPrice, legUnitsUsdJpy, legUnitsUsdCnh, clientTag)
@@ -633,8 +612,8 @@ class TriangularGridStrategy:
         if level.levelState != LevelState.HELD or level.levelTakeProfitSyntheticPrice is None:
             return
         if syntheticPrice >= level.levelTakeProfitSyntheticPrice:
-            legUnitsUsdJpy = int(round(-level.usdNotionalPerLeg))
-            legUnitsUsdCnh = int(round(+level.usdNotionalPerLeg))
+            legUnitsUsdJpy = int(round(-abs(level.usdNotionalPerLeg)))
+            legUnitsUsdCnh = int(round(+abs(level.usdNotionalPerLeg)))
             clientTag = f"lvl-exit-{int(level.levelPrice*1e6)}"
             didExecute = self.executionBroker.executeTwoLegMarket(legUnitsUsdJpy, legUnitsUsdCnh, clientTag, timestamp)
             if not didExecute:
@@ -642,9 +621,8 @@ class TriangularGridStrategy:
             level.levelState = LevelState.IDLE
             level.levelEntrySyntheticPrice = None
             level.levelTakeProfitSyntheticPrice = None
-            self.strategyState.activeCapitalUsdUnlevered = max(
-                self.strategyState.activeCapitalUsdUnlevered - self.riskConfig.buyWagerUsd, 0.0
-            )
+            level.usdNotionalPerLeg = abs(level.usdNotionalPerLeg)
+            self.strategyState.activeCapitalUsdUnlevered = max(self.strategyState.activeCapitalUsdUnlevered - self.riskConfig.buyWagerUsd, 0.0)
             self.strategyState.tradesClosedCount += 1
             self.stateStore.recordExecution(timestamp, "CLOSE", level.levelPrice, legUnitsUsdJpy, legUnitsUsdCnh, clientTag)
             self.stateStore.saveGridLevels([level])
@@ -690,9 +668,7 @@ def getOandaPriceFeedFromEnv() -> OandaPriceFeed:
     return OandaPriceFeed(accountId=accountId, apiToken=apiToken, isPractice=isPractice)
 
 
-def fetchOandaDailyMidSeries(
-    accountId: str, apiToken: str, isPractice: bool, instrument: str, days: int
-) -> List[Tuple[datetime, float]]:
+def fetchOandaDailyMidSeries(accountId: str, apiToken: str, isPractice: bool, instrument: str, days: int) -> List[Tuple[datetime, float]]:
     host = "https://api-fxpractice.oanda.com" if isPractice else "https://api-fxtrade.oanda.com"
     url = f"{host}/v3/instruments/{instrument}/candles"
     params = {"granularity": "D", "price": "M", "count": str(max(2, days + 2))}
@@ -706,7 +682,7 @@ def fetchOandaDailyMidSeries(
         t = datetime.fromisoformat(c["time"].replace("Z", "+00:00"))
         m = c.get("mid", {})
         if "c" in m:
-            out.append((t, float(m["c"])))
+            out.append((t, float(m["c"])) )
     out.sort(key=lambda x: x[0])
     start = datetime.now(timezone.utc) - timedelta(days=days)
     return [(t, v) for t, v in out if t >= start]

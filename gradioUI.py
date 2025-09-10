@@ -37,12 +37,19 @@ def _fmtUsd(x: float) -> str:
     except Exception:
         return "$0.00"
 
+def _fmt6(x) -> str:
+    try:
+        return f"{float(x):.6f}"
+    except Exception:
+        return "—"
+
 def uiMakeStatusText(st: dict) -> str:
     running = "🟢 running" if st.get("running") else "🔴 stopped"
     risk = st.get("risk", {}) or {}
     strat = st.get("strategy", {}) or {}
+    hs = st.get("hs", {}) or {}
 
-    # Pull server-provided margin fields if available, else approximate
+    # Margin display (server-preferred, fallback approximate)
     held = strat.get("heldLevels", 0)
     mr = risk.get("marginRateApprox", 0.035)
     perLevelMargin = risk.get("perLevelMarginUsd", risk.get("buyWagerUsd", 0.0) * risk.get("leverageMultiplier", 1.0) * mr)
@@ -50,26 +57,37 @@ def uiMakeStatusText(st: dict) -> str:
     estLimit = strat.get("estMarginLimitUsd", risk.get("totalCapitalUsd", 0.0) * risk.get("marginUtilizationLimit", 0.8))
     usedPct = strat.get("estMarginUsedPct", (estUsed / estLimit) if estLimit else 0.0)
 
-    return (
+    # Optional HS/BI from server
+    hsHigh = hs.get("high")
+    hsLow = hs.get("low")
+    bi = hs.get("buyIncrement")
+
+    head = (
         f"{running} | broker={st.get('broker')} | "
         f"BW={_fmtUsd(risk.get('buyWagerUsd', 0))} | "
         f"leverage={risk.get('leverageMultiplier', 1)}x | "
         f"TP={risk.get('takeProfitPct', 0)*100:.2f}% | "
         f"levels={risk.get('numBuyWagers', 0)} | "
-        f"held={held} | "
-        f"opened={strat.get('tradesOpenedCount', 0)} | "
+        f"held={held} | opened={strat.get('tradesOpenedCount', 0)} | "
         f"closedBot={strat.get('tradesClosedCount', 0)} | "
         f"closedExt={strat.get('tradesClosedExternalCount', 0)} | "
         f"margin used={_fmtUsd(estUsed)}/{_fmtUsd(estLimit)} ({usedPct*100:.1f}%)"
     )
+
+    if hsHigh is not None or hsLow is not None or bi is not None:
+        head += f" | HS high={_fmt6(hsHigh)} low={_fmt6(hsLow)} | BI={_fmt6(bi)}"
+
+    return head
 
 def uiMakeSyncHtml(st: dict) -> str:
     sync = st.get("sync", {}) or {}
     status = str(sync.get("status", "OK")).upper()
     detail = sync.get("detail", "")
     color = "#16a34a" if status == "OK" else ("#ca8a04" if status == "RECOVERING" else "#dc2626")
-    return f'<div style="padding:6px 10px;border-radius:10px;background:{color};color:#fff;display:inline-block;">sync: {status}</div>' + \
-           (f"<div style='margin-top:6px;font-size:12px'>{detail}</div>" if detail else "")
+    return (
+        f'<div style="padding:6px 10px;border-radius:10px;background:{color};color:#fff;display:inline-block;">sync: {status}</div>'
+        + (f"<div style='margin-top:6px;font-size:12px'>{detail}</div>" if detail else "")
+    )
 
 def uiMakeAccountText(st: dict) -> str:
     acc = st.get("account") or {}
@@ -99,11 +117,11 @@ def uiFetchLevels():
     rows = []
     for d in res:
         rows.append([
-            d["levelPrice"],
-            d["state"],
-            d["entry"] if d["entry"] is not None else "",
-            d["takeProfit"] if d["takeProfit"] is not None else "",
-            d["usdNotionalPerLeg"],
+            d.get("levelPrice"),
+            d.get("state"),
+            d.get("entry") if d.get("entry") is not None else "",
+            d.get("takeProfit") if d.get("takeProfit") is not None else "",
+            d.get("usdNotionalPerLeg"),
         ])
     return rows
 
@@ -111,13 +129,13 @@ def uiFetchExecutions(limit: int):
     res = _get("/executions", {"limit": int(limit)})
     if isinstance(res, dict) and "error" in res:
         return []
-    return [[e["ts"], e["action"], e["levelPrice"], e["unitsUsdJpy"], e["unitsUsdCnh"], e["clientTag"]] for e in res]
+    return [[e.get("ts"), e.get("action"), e.get("levelPrice"), e.get("unitsUsdJpy"), e.get("unitsUsdCnh"), e.get("clientTag")] for e in res]
 
 def uiFetchHistoryDf(days: int) -> pd.DataFrame:
     res = _get("/history", {"days": int(days), "points": 1200})
     if isinstance(res, dict) and "error" in res:
         return pd.DataFrame({"epoch": [], "price": []})
-    return pd.DataFrame({"epoch": res["timestamps"], "price": res["cnhjpy"]})
+    return pd.DataFrame({"epoch": res.get("timestamps", []), "price": res.get("cnhjpy", [])})
 
 def uiMakeHistoryPlot(histDf: pd.DataFrame):
     fig, ax = plt.subplots()
@@ -173,6 +191,16 @@ def uiUpdateRisk(totalCapitalUsd: float, leverageMultiplier: float, takeProfitPc
     statusText, _, _, _ = uiFetchStatusBundle()
     return statusText
 
+def _fmtMaybe(x, kind="num", digits=2):
+    try:
+        if x is None: return "—"
+        if kind == "usd": return _fmtUsd(x)
+        if kind == "pct": return f"{float(x)*100:.{digits}f}%"
+        if kind == "num": return f"{float(x):.{digits}f}"
+        return str(x)
+    except Exception:
+        return "—"
+
 def uiOptimize(minLevels, maxLevels, stepLevels, lookbackDays, marginRateApprox, roundTripCostUsd, marginUtilizationLimit, applyNow):
     payload = {
         "minLevels": int(minLevels),
@@ -189,25 +217,34 @@ def uiOptimize(minLevels, maxLevels, stepLevels, lookbackDays, marginRateApprox,
         return f"Optimize error: {res['error']}", []
     if isinstance(res, dict) and "detail" in res:
         return f"Optimize error: {res['detail']}", []
+
     best = res.get("best", {})
     if not best:
         return "No result", []
+
     txt = (
         f"Best numBuyWagers={best.get('numBuyWagers')} | "
-        f"BI={best.get('buyIncrement'):.6f} | "
-        f"EV/day=${best.get('evPerDayUsd'):.2f} | "
-        f"trades/day={best.get('tradesPerDay'):.2f} | "
-        f"avgConc={best.get('avgConcurrentLevels'):.1f} | "
-        f"maxConc={best.get('maxConcurrentLevels')} | "
-        f"BW=${best.get('bwUsd'):.2f} | peakMargin=${best.get('peakMarginUsd'):.2f}"
+        f"BI={_fmt6(best.get('buyIncrement'))} | "
+        f"EV/day={_fmtUsd(best.get('evPerDayUsd'))} | "
+        f"trades/day={_fmtMaybe(best.get('tradesPerDay'))} | "
+        f"avgConc={_fmtMaybe(best.get('avgConcurrentLevels'))} | "
+        f"maxConc={best.get('maxConcurrentLevels', '—')} | "
+        f"BW={_fmtUsd(best.get('bwUsd'))} | peakMargin={_fmtUsd(best.get('peakMarginUsd'))}"
     )
+
     rows = res.get("candidates", [])
     out = []
     for r in rows:
         out.append([
-            r["numBuyWagers"], r["buyIncrement"], r["evPerDayUsd"], r["trades"],
-            r["tradesPerDay"], r["avgConcurrentLevels"], r["maxConcurrentLevels"],
-            r["bwUsd"], r["peakMarginUsd"]
+            r.get("numBuyWagers"),
+            r.get("buyIncrement"),
+            r.get("evPerDayUsd"),
+            r.get("trades", r.get("tradesTotal", "—")),
+            r.get("tradesPerDay"),
+            r.get("avgConcurrentLevels"),
+            r.get("maxConcurrentLevels"),
+            r.get("bwUsd"),
+            r.get("peakMarginUsd"),
         ])
     return txt, out
 
@@ -226,6 +263,7 @@ with gr.Blocks(title="Triangular Grid Trader") as demo:
         auditBtn = gr.Button("Audit Consistency")
         refreshBtn = gr.Button("Refresh", elem_id="tgRefreshBtn")
 
+    # Push-style auto-refresh via SSE (execution/risk/control)
     autoPushToggle = gr.Checkbox(label="Auto-refresh on trade (push)", value=True)
     eventBridge = gr.HTML(f"""
 <script>
@@ -237,8 +275,17 @@ with gr.Blocks(title="Triangular Grid Trader") as demo:
     const es = new EventSource(apiBase + "/events");
     es.onmessage = function(e) {{
       if (!enabled) return;
-      const btn = document.getElementById("tgRefreshBtn");
-      if (btn) btn.click();
+      try {{
+        const payload = e.data ? JSON.parse(e.data) : {{}};
+        const t = payload && payload.type ? String(payload.type) : "";
+        if (!t || t === "execution" || t === "risk" || t === "control") {{
+          const btn = document.getElementById("tgRefreshBtn");
+          if (btn) btn.click();
+        }}
+      }} catch (_err) {{
+        const btn = document.getElementById("tgRefreshBtn");
+        if (btn) btn.click();
+      }}
     }};
   }} catch (err) {{ console.warn("SSE connect failed:", err); }}
 }})();
